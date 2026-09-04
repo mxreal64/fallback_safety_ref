@@ -168,13 +168,34 @@ namespace safety_profile {
     struct SafetyControlBlock : public ControlBlockBase {
         T instance;
         std::atomic<std::size_t> ref_count{1};
-        std::vector<void*> raw_outgoing_edges;
+
+        // REPLACED VECTOR: Intrusive singly-linked list of edge allocations
+        std::atomic<EdgeNode*> edge_head{nullptr};
 
         // Inline atomic spinlock adding practically zero memory overhead compared to std::mutex
         std::atomic_flag lock_flag;
 
         template <typename... Args>
         SafetyControlBlock(Args&&... args) : instance(std::forward<Args>(args)...) {}
+
+        // Custom destructor to safely push discarded edges back into the global recycle engine
+        virtual ~SafetyControlBlock() override {
+            EdgeNode* current = edge_head.load(std::memory_order_relaxed);
+            while (current) {
+                EdgeNode* next = current->next_edge;
+
+                // Return the node cleanly to the lock-free global edge pool
+                EdgeNode* old_recycle_head = detail::global_edge_recycle_head.load(std::memory_order_relaxed);
+                do {
+                    current->next_edge = old_recycle_head;
+                } while (!detail::global_edge_recycle_head.compare_exchange_weak(
+                    old_recycle_head, current,
+                    std::memory_order_release,
+                    std::memory_order_relaxed));
+
+                current = next;
+            }
+        }
 
         void* operator new(std::size_t) {
             return detail::get_local_arena<SafetyControlBlock<T>>().allocate();
@@ -194,15 +215,20 @@ namespace safety_profile {
             lock_flag.clear(std::memory_order_release);
         }
 
-        // Deadlock Proof & Race Proof
+        // Deadlock Proof & Race Proof using the Intrusive Edge Graph
         bool find_cycle_dfs(void* target, std::unordered_set<void*>& visited) {
             if (this == target) return true;
             if (visited.contains(this)) return false;
             visited.insert(this);
 
+            // Snapshot the linked list pointer addresses under the spinlock boundary
             std::vector<void*> edges_snapshot;
             this->lock();
-            edges_snapshot = raw_outgoing_edges;
+            EdgeNode* current = edge_head.load(std::memory_order_relaxed);
+            while (current) {
+                edges_snapshot.push_back(current->target_block);
+                current = current->next_edge;
+            }
             this->unlock();
 
             for (void* edge : edges_snapshot) {
@@ -215,8 +241,14 @@ namespace safety_profile {
         }
 
         void register_edge(void* target_block) {
+            // Pull a pre-allocated edge slot from your lock-free ThreadLocalArena
+            auto* new_edge = static_cast<EdgeNode*>(detail::get_local_arena<EdgeNode>().allocate());
+            new_edge->target_block = target_block;
+
+            // Intrusively push the edge node onto our atomic stack head under lock bounds
             this->lock();
-            raw_outgoing_edges.push_back(target_block);
+            new_edge->next_edge = edge_head.load(std::memory_order_relaxed);
+            edge_head.store(new_edge, std::memory_order_relaxed);
             this->unlock();
 
             std::unordered_set<void*> visited;
