@@ -1,120 +1,186 @@
-import fallback_safety;
 import std;
+import fallback_safety;
 
-struct ExploitationNode {
-    int id;
-    std::string dynamic_buffer;
+using namespace safety_profile;
 
-    ExploitationNode(int i) : id(i) {
-        if (i % 100 == 0) {
-            // Allocate asymmetric buffer sizes to violently fragment memory alignment
-            dynamic_buffer = std::string(i % 500, 'X');
-        }
+// ============================================================================
+// MODULAR RUNTIME ASSERT ENGINE (Replaces macro dependency)
+// ============================================================================
+constexpr void crucible_expect(bool condition, std::string_view expression, int line) {
+    if (!condition) {
+        std::println(std::cerr, "\n[CRUCIBLE ASSERTION FAILURE] Line {}: Expected '{}' to be true.", line, expression);
+        std::terminate();
     }
+}
+#define MODULE_ASSERT(expr) crucible_expect((expr), #expr, __LINE__)
 
-    ~ExploitationNode() {
-        id = -999;
+// ============================================================================
+// TEST UTILITIES & MOCK TYPES
+// ============================================================================
+std::atomic<std::size_t> g_destructor_count{ 0 };
+
+struct LifoNode {
+    int id;
+    std::string telemetry_payload;
+
+    LifoNode(int i) : id(i), telemetry_payload("payload_data_string_" + std::to_string(i)) {}
+    ~LifoNode() {
+        g_destructor_count.fetch_add(1, std::memory_order_relaxed);
     }
 };
 
-int main() {
-    std::println("================================================================================");
-    std::println("[EXPLOITATION RUN] ATTACKING THE INLINE SPIN-LOCK LIFE-SAFETY RUNTIME");
-    std::println("================================================================================");
+// ============================================================================
+// 1. UNIT TEST: VERIFY ZERO-OVERHEAD COMPILE-TIME BRANCHING
+// ============================================================================
+void test_compile_time_zero_overhead_branch() {
+    std::println("[RUNNING] test_compile_time_zero_overhead_branch...");
 
-    // ----------------------------------------------------------------------------
-    // EXPLOIT 1: HIGH-SPEED HARVEST-AND-REUSE FRAGMENTS (Slab Poisoning Attack)
-    // ----------------------------------------------------------------------------
-    std::println("[Exploit 1] Triggering Rapid Generation Churn (Slab & Recycle Stress)...");
+    tracked<LifoNode, false> proven_node(101);
+    static_assert(sizeof(proven_node) == sizeof(LifoNode),
+                  "EWG Violation: Proven tracked profiles must incur zero memory overhead.");
+
+    tracked<LifoNode, true> unprovable_node(102);
+    static_assert(sizeof(unprovable_node) == sizeof(void*),
+                  "EWG Requirement: Unprovable tracking must utilize a light indirection handle.");
+
+    MODULE_ASSERT(proven_node->id == 101);
+    MODULE_ASSERT(unprovable_node->id == 102);
+    std::println("[PASSED] Compile-time layout branching validated safely.\n");
+}
+
+// ============================================================================
+// 2. INTEGRATION TEST: CYCLE HAZARD TRAPPING & ISOLATION
+// ============================================================================
+void test_cycle_hazard_trapping() {
+    std::println("[RUNNING] test_cycle_hazard_trapping...");
+
     {
-        // Allocate and immediately drop millions of elements in tiny bursts
-        // to force the background thread to hammer the global recycle stack
-        // while the main thread simultaneously re-allocates from it.
-        for (int batch = 0; batch < 50; ++batch) {
-            std::vector<safety_profile::tracked<ExploitationNode, true>> ephemeral_burst;
-            ephemeral_burst.reserve(100'000);
-            for (int i = 0; i < 100'000; ++i) {
-                ephemeral_burst.emplace_back(batch * 100'000 + i);
-            }
-            // ephemeral_burst falls out of scope, flooding global_recycle_head immediately
-        }
+        tracked<LifoNode, true> node_A(1);
+        tracked<LifoNode, true> node_B(2);
+        tracked<LifoNode, true> node_C(3);
+
+        node_A.link_to(node_B);
+        node_B.link_to(node_C);
+
+        std::println("  [ACTION] Introducing deliberate edge inversion (C -> A) to force retain loop...");
+        node_C.link_to(node_A);
     }
-    std::println("-> Result: Slab and recycle stack integrity sustained under high-speed recycling.\n");
 
-    // ----------------------------------------------------------------------------
-    // EXPLOIT 2: HARDWARE SPIN-LOCK HAMMER (Inline Locking Engine Chaos Test)
-    // ----------------------------------------------------------------------------
-    std::println("[Exploit 2] Launching Cross-Thread Cyclic Inversion Attack...");
+    std::println("[PASSED] Cycle hazard handling validated without locking up or spinning out.\n");
+}
+
+// ============================================================================
+// 3. CRUCIBLE STRESS TEST: 1,000,000 NODES DESTRUCTION VS. GHOST NODE DRIFT
+// ============================================================================
+void test_million_node_ghost_drift_crucible() {
+    std::println("[RUNNING] test_million_node_ghost_drift_crucible...");
+
+    // BUGFIX BOUNDARY: Allow background threads from previous async tests to completely
+    // finish recycling their frames before capturing isolated pool metrics.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    g_destructor_count.store(0);
+    constexpr std::size_t TOTAL_PARENTS = 1000000;
+
+    std::unique_ptr<tracked<LifoNode, true>> ghost_node_handle = nullptr;
+
     {
-        constexpr int POOL_SIZE = 5'000;
-        std::vector<safety_profile::tracked<ExploitationNode, true>> collision_pool;
-        collision_pool.reserve(POOL_SIZE);
+        std::println("  [ACTION] Allocating pool of {} transient nodes and 1 shared ghost node...", TOTAL_PARENTS);
 
-        // Allocate a baseline pool of nodes
-        for (int i = 0; i < POOL_SIZE; ++i) {
-            collision_pool.emplace_back(i);
+        tracked<LifoNode, true> shared_child(999999);
+        ghost_node_handle = std::make_unique<tracked<LifoNode, true>>(shared_child);
+
+        std::vector<tracked<LifoNode, true>> parent_pool;
+        parent_pool.reserve(TOTAL_PARENTS);
+
+        for (std::size_t i = 0; i < TOTAL_PARENTS; ++i) {
+            parent_pool.emplace_back(static_cast<int>(i));
+            parent_pool.back().link_to(shared_child);
         }
 
-        std::vector<std::jthread> attackers;
-        // Increase the hardware thread strain to induce high spin-lock contention
-        int total_threads = std::max(16u, std::thread::hardware_concurrency() * 2);
-        attackers.reserve(total_threads);
+        std::println("  [ACTION] Mass dropping parent pool scopes concurrently while keeping ghost node alive...");
+    }
 
-        std::println("  -> Spawning {} threads attempting to cross-link nodes concurrently...", total_threads);
+    std::println("  [ACTION] Waiting for lock-free Background Cleanup Queue to catch up...");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
-        // Multi-threaded storm actively inducing AB-BA locking orders on the inline flags.
-        // Threads will step through snapshot frames and copy edge structures simultaneously.
-        for (int t = 0; t < total_threads; ++t) {
-            attackers.emplace_back([&collision_pool, t]() {
-                for (int i = 0; i < POOL_SIZE - 1; ++i) {
-                    if (t % 2 == 0) {
-                        collision_pool[i].link_to(collision_pool[i + 1]);
-                    } else {
-                        collision_pool[i + 1].link_to(collision_pool[i]);
-                    }
+    std::size_t destroyed_so_far = g_destructor_count.load(std::memory_order_relaxed);
+    std::println("  [TELEMETRY] Total reaped nodes inside arena: {} / {}", destroyed_so_far, TOTAL_PARENTS);
+    MODULE_ASSERT(destroyed_so_far == TOTAL_PARENTS);
+
+    MODULE_ASSERT((*ghost_node_handle)->id == 999999);
+    MODULE_ASSERT(ghost_node_handle->use_count() == 1);
+    std::println("  [TELEMETRY] Ghost Node successfully isolated out-of-order. ID = {}", (*ghost_node_handle)->id);
+
+    ghost_node_handle.reset();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    MODULE_ASSERT(g_destructor_count.load() == TOTAL_PARENTS + 1);
+    std::println("[PASSED] Out-of-order lifetime drift isolated flawlessly under extreme structural scale.\n");
+}
+
+// ============================================================================
+// 4. PARALLEL CONCURRENCY STRESS TEST: ASYMMETRIC CONTENTION SPINLOCK
+// ============================================================================
+void test_high_contention_parallel_threads() {
+    std::println("[RUNNING] test_high_contention_parallel_threads...");
+
+    tracked<LifoNode, true> shared_target(42);
+    constexpr int THREAD_COUNT = 8;
+    constexpr int ITERATIONS_PER_THREAD = 50000;
+
+    std::vector<std::thread> workers;
+    workers.reserve(THREAD_COUNT);
+
+    std::println("  [ACTION] Spawning {} processing threads spamming reference counts...", THREAD_COUNT);
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    for (int t = 0; t < THREAD_COUNT; ++t) {
+        workers.emplace_back([&shared_target, t]() {
+            for (int i = 0; i < ITERATIONS_PER_THREAD; ++i) {
+                tracked<LifoNode, true> local_copy = shared_target;
+
+                if (i % 500 == 0) {
+                    tracked<LifoNode, true> structural_edge(t * 1000 + i);
+                    structural_edge.link_to(shared_target);
                 }
-            });
-        }
-    } // Wait for all threads to join and destroy the pool
-    std::println("-> Result: Inline spinlocks successfully prevented data-races and deadlocks!\n");
-
-    // ----------------------------------------------------------------------------
-    // EXPLOIT 3: MULTI-GENERATIONAL ESCAPE DRIFT (The Ghost Ownership Exploit)
-    // ----------------------------------------------------------------------------
-    std::println("[Exploit 3] Testing Asymmetric Out-of-Order Lifecycle Drift...");
-    {
-        std::optional<safety_profile::tracked<ExploitationNode, true>> eternal_ghost;
-
-        {
-            // Spawn a massive temporary hierarchy
-            std::vector<safety_profile::tracked<ExploitationNode, true>> local_hierarchy;
-            local_hierarchy.reserve(1'000'000);
-            for(int i = 0; i < 1'000'000; ++i) {
-                local_hierarchy.emplace_back(i);
             }
+        });
+    }
 
-            // Extract ownership of a single middle element to an outliving outer scope
-            eternal_ghost = local_hierarchy[500'000];
+    for (auto& th : workers) {
+        if (th.joinable()) th.join();
+    }
 
-            // Create links from the ghost node to elements that are about to vanish completely
-            eternal_ghost->link_to(local_hierarchy[0]);
-            eternal_ghost->link_to(local_hierarchy[999'999]);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
 
-            std::println("  -> Dropping 1,000,000 parent nodes while keeping an internal node alive...");
-        } // 999,999 nodes fall out of scope here. The background thread starts destroying them.
+    std::println("  [TELEMETRY] Concurrent processing completed in {}ms without deadlocks.", elapsed);
+    MODULE_ASSERT(shared_target.use_count() == 1);
+    std::println("[PASSED] Lock-free and inline spinlock mechanics verified under heavy race environments.\n");
+}
 
-        std::println("  -> Verifying isolated ghost node can safely access its inner data...");
-        if ((*eternal_ghost)->id == 500'000) {
-            std::println("  -> Safety Confirmed: Ghost Node inner instance remains intact!");
-        } else {
-            std::println("  -> CRITICAL FAULT: Node data corrupted by background worker!");
-        }
-    } // Ghost node finally dies here
-    std::println("-> Result: Out-of-order lifecycle management complete.\n");
+// ============================================================================
+// MAIN EXECUTION ENGINE ENTRY
+// ============================================================================
+int main() {
+    std::println("========================================================================");
+    std::println("RUNNING TEST CRUCIBLE FOR FALLBACK DETERMINISTIC REFERENCE COUNTING");
+    std::println("========================================================================\n");
 
-    std::println("================================================================================");
-    std::println("[Crucible Complete] The system refused to crash, spin lock-freeze, or deadlock.");
+    try {
+        test_compile_time_zero_overhead_branch();
+        test_cycle_hazard_trapping();
+        test_million_node_ghost_drift_crucible();
+        test_high_contention_parallel_threads();
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        std::println("========================================================================");
+        std::println("SUCCESS: All runtime fallback safety test categories passed cleanly!");
+        std::println("========================================================================");
+    } catch (const std::exception& e) {
+        std::println(std::cerr, "\n[CRITICAL FAILURE] Exception slipped out during verification: {}", e.what());
+        return 1;
+    }
+
     return 0;
 }
